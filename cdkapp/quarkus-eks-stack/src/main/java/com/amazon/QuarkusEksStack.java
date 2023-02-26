@@ -21,7 +21,7 @@ package com.amazon;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,29 +30,30 @@ import software.amazon.awscdk.RemovalPolicy;
 import software.amazon.awscdk.Stack;
 import software.amazon.awscdk.StackProps;
 import software.amazon.awscdk.cdk.lambdalayer.kubectl.v24.KubectlV24Layer;
-import software.amazon.awscdk.services.autoscaling.AutoScalingGroup;
-import software.amazon.awscdk.services.autoscaling.UpdatePolicy;
 import software.amazon.awscdk.services.dynamodb.Attribute;
 import software.amazon.awscdk.services.dynamodb.AttributeType;
 import software.amazon.awscdk.services.dynamodb.Table;
-import software.amazon.awscdk.services.ec2.InstanceClass;
-import software.amazon.awscdk.services.ec2.InstanceSize;
 import software.amazon.awscdk.services.ec2.InstanceType;
+import software.amazon.awscdk.services.ec2.SubnetConfiguration;
+import software.amazon.awscdk.services.ec2.SubnetSelection;
+import software.amazon.awscdk.services.ec2.SubnetType;
 import software.amazon.awscdk.services.ec2.Vpc;
 import software.amazon.awscdk.services.ecr.Repository;
 import software.amazon.awscdk.services.eks.AlbControllerOptions;
 import software.amazon.awscdk.services.eks.AlbControllerVersion;
-import software.amazon.awscdk.services.eks.AutoScalingGroupOptions;
+import software.amazon.awscdk.services.eks.CapacityType;
 import software.amazon.awscdk.services.eks.Cluster;
-import software.amazon.awscdk.services.eks.ClusterLoggingTypes;
-import software.amazon.awscdk.services.eks.EksOptimizedImage;
 import software.amazon.awscdk.services.eks.HelmChartOptions;
 import software.amazon.awscdk.services.eks.KubernetesManifest;
 import software.amazon.awscdk.services.eks.KubernetesVersion;
-import software.amazon.awscdk.services.eks.NodeType;
+import software.amazon.awscdk.services.eks.NodegroupAmiType;
+import software.amazon.awscdk.services.eks.NodegroupOptions;
 import software.amazon.awscdk.services.eks.ServiceAccount;
 import software.amazon.awscdk.services.eks.ServiceAccountOptions;
 import software.amazon.awscdk.services.events.EventBus;
+import software.amazon.awscdk.services.iam.AccountRootPrincipal;
+import software.amazon.awscdk.services.iam.IRole;
+import software.amazon.awscdk.services.iam.Role;
 import software.constructs.Construct;
 
 public class QuarkusEksStack extends Stack {
@@ -85,55 +86,94 @@ public class QuarkusEksStack extends Stack {
     Vpc vpc = Vpc.Builder
         .create(this, "QuarkusEKSVpc")
         .vpcName("QuarkusEKSVPC")
+        .enableDnsHostnames(true)
+        .enableDnsSupport(true)
+        .maxAzs(2)
+        .reservedAzs(2)
+        .subnetConfiguration(List.of(SubnetConfiguration
+                                         .builder()
+                                         .name("ingress")
+                                         .subnetType(SubnetType.PUBLIC)
+                                         .build(), SubnetConfiguration
+                                         .builder()
+                                         .name("application")
+                                         .subnetType(SubnetType.PRIVATE_WITH_EGRESS)
+                                         .build()))
+        .build();
+
+
+    // Entire EKS Cluster managed by this Role
+    IRole eksMasterRole = Role.Builder
+        .create(this, "EksMasterRole")
+        .roleName(this.getStackName() + "_EKSMasterRole")
+        .assumedBy(new AccountRootPrincipal())
         .build();
 
     // Second step is to create the EKS cluster
     Cluster eksCluster = Cluster.Builder
         .create(this, "Cluster")
         .clusterName("QuarkusEKSCluster")
-        .vpc(vpc)
-        .defaultCapacity(0)
-        .clusterLogging(Arrays.asList(ClusterLoggingTypes.API,
-                                      ClusterLoggingTypes.AUDIT,
-                                      ClusterLoggingTypes.AUTHENTICATOR,
-                                      ClusterLoggingTypes.CONTROLLER_MANAGER,
-                                      ClusterLoggingTypes.SCHEDULER))
         .version(KubernetesVersion.V1_24)
+        .vpc(vpc)
+        .vpcSubnets(List.of(SubnetSelection
+                                .builder()
+                                .subnetType(SubnetType.PUBLIC)
+                                .build(), SubnetSelection
+                                .builder()
+                                .subnetType(SubnetType.PRIVATE_WITH_EGRESS)
+                                .build()))
         .outputClusterName(true)
         .outputConfigCommand(true)
         .outputMastersRoleArn(true)
+        .mastersRole(eksMasterRole)
         .kubectlLayer(new KubectlV24Layer(this, "kubectl"))
         .albController(AlbControllerOptions
                            .builder()
-                           .version(
-                               AlbControllerVersion.V2_4_1)
+                           .version(AlbControllerVersion.V2_4_1)
                            .build())
+        .defaultCapacity(0)
         .build();
 
-    // Of course we need an ASG
-    AutoScalingGroup eksAsg = AutoScalingGroup.Builder
-        .create(this, "QuarkusEKSASG")
-        .autoScalingGroupName("QuarkusEKSASG")
-        .vpc(vpc)
-        .minCapacity(3)
-        .maxCapacity(9)
-        .instanceType(
-            InstanceType.of(InstanceClass.BURSTABLE3,
-                            InstanceSize.MEDIUM))
-        .machineImage(
-            EksOptimizedImage.Builder
-                .create()
-                .kubernetesVersion(
-                    KubernetesVersion.V1_24.getVersion())
-                .nodeType(
-                    NodeType.STANDARD)
-                .build())
-        .updatePolicy(UpdatePolicy.rollingUpdate())
-        .build();
+    InstanceType       t3Medium    = new InstanceType("t3.medium");
+    List<InstanceType> x86_x64List = new ArrayList<>();
+    x86_x64List.add(t3Medium);
 
-    eksCluster.connectAutoScalingGroupCapacity(eksAsg, AutoScalingGroupOptions
+    InstanceType       t4gMedium = new InstanceType("t4g.medium");
+    List<InstanceType> arm64List = new ArrayList<>();
+    arm64List.add(t4gMedium);
+
+    NodegroupOptions x86 = NodegroupOptions
         .builder()
-        .build());
+        .amiType(NodegroupAmiType.AL2_X86_64)
+        .nodegroupName("X86_64ManagedNodeGroup")
+        .instanceTypes(x86_x64List)
+        .subnets(SubnetSelection
+                     .builder()
+                     .subnetType(SubnetType.PRIVATE_WITH_EGRESS)
+                     .build())
+        .minSize(1)
+        .maxSize(4)
+        .desiredSize(1)
+        .capacityType(CapacityType.SPOT)
+        .build();
+
+    NodegroupOptions arm64 = NodegroupOptions
+        .builder()
+        .amiType(NodegroupAmiType.AL2_ARM_64)
+        .nodegroupName("ARM64ManagedNodeGroup")
+        .instanceTypes(arm64List)
+        .subnets(SubnetSelection
+                     .builder()
+                     .subnetType(SubnetType.PRIVATE_WITH_EGRESS)
+                     .build())
+        .minSize(2)
+        .maxSize(3)
+        .desiredSize(2)
+        .capacityType(CapacityType.ON_DEMAND)
+        .build();
+
+    eksCluster.addNodegroupCapacity("x86_64", x86);
+    eksCluster.addNodegroupCapacity("Arm64", arm64);
 
     // And a service account for pod permissions
 
